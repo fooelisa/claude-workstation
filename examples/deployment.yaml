@@ -1,0 +1,121 @@
+---
+# Minimal Kubernetes Deployment for claude-workstation.
+# - Two PVCs, persistent across pod restarts: home (10Gi) and repos (30Gi)
+# - Single replica (one tmux session = one concurrent user, by design)
+# - initContainer chowns the volumes to UID 1000 before the main container starts
+# - TCP probe on ttyd's port (no HTTP healthcheck endpoint)
+#
+# Not included here (because they're network-shape decisions):
+#   - Ingress / Service (depending on whether you front this with Traefik,
+#     Tailscale, Cloudflare Tunnel, raw NodePort, etc.)
+#   - NetworkPolicy
+#   - Resource requests/limits (tune to your cluster)
+#   - Seafile-sync sidecar (optional; see README "Seafile sync sidecar"). To
+#     enable: add a `claude-seafile` PVC, mount it at /seafile in both
+#     containers, and add a second container with
+#     `command: ["/usr/local/bin/seafile-sync.sh"]`.
+#
+# Replace <your-account> with your GHCR owner.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: claude
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claude-home
+  namespace: claude
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claude-repos
+  namespace: claude
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 30Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude
+  namespace: claude
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # ReadWriteOnce PVCs + single-writer tmux
+  selector:
+    matchLabels:
+      app: claude
+  template:
+    metadata:
+      labels:
+        app: claude
+    spec:
+      initContainers:
+        - name: init-permissions
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 1000:1000 /home/claude /repos"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: home
+              mountPath: /home/claude
+            - name: repos
+              mountPath: /repos
+      containers:
+        - name: main
+          image: ghcr.io/<your-account>/claude-workstation:main
+          ports:
+            - name: ttyd
+              containerPort: 7681
+          env:
+            - name: HOME
+              value: /home/claude
+            - name: TERM
+              value: xterm-256color
+          livenessProbe:
+            tcpSocket:
+              port: 7681
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: 7681
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: home
+              mountPath: /home/claude
+            - name: repos
+              mountPath: /repos
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: claude-home
+        - name: repos
+          persistentVolumeClaim:
+            claimName: claude-repos
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude
+  namespace: claude
+spec:
+  selector:
+    app: claude
+  ports:
+    - port: 7681
+      targetPort: 7681
